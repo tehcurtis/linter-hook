@@ -1,0 +1,53 @@
+# lint-hook.toml — optional per-repo overrides. Place at your repo root.
+#
+# NOT full TOML. lint-hook parses a deliberately tiny subset with plain Bash so
+# the tool can stay zero-dependency:
+#
+#   * `key = "value"`      — string
+#   * `key = 10`           — bare number
+#   * `key = true|false`   — boolean
+#   * `key = ["a", "b"]`   — single-line array only
+#   * `# comment`          — whole-line or trailing
+#
+# No tables/sections (`[tool.foo]`), no multi-line values, no nested structures.
+# Anything it can't parse is ignored rather than treated as an error, so a
+# malformed config never blocks an edit.
+#
+# Precedence: this file wins over auto-detection.
+
+# ---------------------------------------------------------------------------
+# Global switches
+# ---------------------------------------------------------------------------
+
+# Apply safe autofixes and formatting before reporting. On by default. When a
+# fix lands, lint-hook exits 2 with a "re-read before further edits" notice so
+# the agent refreshes its now-stale view of the file.
+# autofix = true
+
+# Per-linter wall-clock limit in seconds, enforced with timeout(1).
+# timeout = 10
+
+# Extensions to skip entirely. Bare extension names, no leading dot.
+# disable = ["md", "json"]
+
+# Cap on lines of linter output forwarded to the agent; the rest is elided as
+# "…N more". Keeps one disastrous file from flooding the context window.
+# max_output_lines = 30
+
+# ---------------------------------------------------------------------------
+# Per-extension overrides
+# ---------------------------------------------------------------------------
+#
+# `ext.<extension>` replaces the detected lint command for that extension.
+# `fix.<extension>` replaces the detected autofix command.
+#
+# `{file}` is substituted with the path to the edited file. Commands run from
+# the repo root.
+
+# ext.py = "ruff check --output-format=concise {file}"
+# fix.py = "ruff check --fix {file} && ruff format {file}"
+
+# ext.sh = "shellcheck --format=gcc {file}"
+# fix.sh = "shfmt -w {file}"
+
+# ext.ts = "npx --no-install eslint --format=unix {file}"

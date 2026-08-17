@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck + shfmt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: Install shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          command -v shellcheck >/dev/null 2>&1 && exit 0
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Install shfmt
+        run: go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
+
+      - name: shellcheck
+        run: shellcheck --severity=style --shell=bash lint-hook.sh
+
+      - name: shfmt (check formatting)
+        run: "$(go env GOPATH)/bin/shfmt --diff --indent 2 --case-indent lint-hook.sh"
+
+  bash32:
+    name: Bash 3.2 syntax check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS runners ship Bash 3.2 as /bin/bash, which is the oldest version
+      # lint-hook supports. Parsing the script with it catches any accidental
+      # use of Bash 4+ syntax (associative arrays, mapfile, ${var,,}).
+      - name: Confirm /bin/bash is 3.2
+        run: /bin/bash --version | head -1
+
+      - name: Parse with Bash 3.2
+        run: /bin/bash -n lint-hook.sh
