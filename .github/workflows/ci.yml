@@ -41,11 +41,13 @@ jobs:
           go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
 
+      # The .bats files are not valid sh, so shellcheck cannot read them; the
+      # helper they all load is plain Bash and is checked.
       - name: shellcheck
-        run: shellcheck --severity=style --shell=bash lint-hook.sh
+        run: shellcheck --severity=style --shell=bash lint-hook.sh test/helpers/common.bash
 
       - name: shfmt (check formatting)
-        run: shfmt --diff --indent 2 --case-indent lint-hook.sh
+        run: shfmt --diff --indent 2 --case-indent lint-hook.sh test/helpers/common.bash
 
   bash32:
     name: Bash 3.2 syntax check
@@ -61,3 +63,37 @@ jobs:
 
       - name: Parse with Bash 3.2
         run: /bin/bash -n lint-hook.sh
+
+  test:
+    name: bats (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # Node is preinstalled on both runners, so npm keeps this to first-party
+      # actions. Into a user prefix, because a global install wants root on the
+      # Linux runner. The suite needs bats 1.5 or newer for `run -<status>`.
+      - name: Install bats
+        run: |
+          npm install -g --prefix "$HOME/.local" bats@1.13.0
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+
+      # The JSON/YAML/TOML checkers are the one part the stubs cannot stand in
+      # for, since there the interpreter is the thing under test. Installing
+      # PyYAML makes that coverage run rather than skip, on both runners.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      # The suite drives the hook through stub linters, so nothing here needs a
+      # real toolchain. The data-format checkers are the exception: they are
+      # the backend, so those tests skip when the backend is absent.
+      - name: bats
+        run: bats --print-output-on-failure test/
