@@ -1,0 +1,9 @@
+.DS_Store
+*.swp
+
+# Scratch space used by the bats suite.
+/test/tmp/
+
+# A real override file used for dogfooding lint-hook on itself; the committed
+# reference lives in lint-hook.toml.example.
+/lint-hook.toml
