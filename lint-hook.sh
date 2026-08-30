@@ -27,8 +27,13 @@ LINT_HOOK_WS=$' \t\n\r'
 # Field separator for the linter table.
 LINT_HOOK_TAB=$'\t'
 
-# Ceiling for config-file lookups; set from the resolved project root.
+# The project root: where linters run from, and the fallback ceiling for
+# config-file lookups when the file is not inside a git repo.
 LINT_HOOK_ROOT=""
+
+# Where the config walk stops, resolved once per run by main. Every find_up in
+# a run asks about the same directory, and working it out costs a git fork.
+LINT_HOOK_CEILING=""
 
 # ---------------------------------------------------------------------------
 # Diagnostics
@@ -93,44 +98,49 @@ json_unescape() {
   printf '%s' "$out"
 }
 
-# Print everything that follows the first unescaped `"<key>"`, or return 1 when
-# the key does not occur.
-json_after_key() {
-  local json="$1" key="$2" before after
+# The one scan for an unescaped `"<key>"`, which all three readers below share.
+# On success sets JSON_KEY_BEFORE to the text in front of the key and
+# JSON_KEY_AFTER to the text behind it and returns 0; returns 1 when the key
+# does not occur. Escaped occurrences are folded back into JSON_KEY_BEFORE
+# rather than dropped, so a caller reading what precedes the key sees all of it.
+json_find_key() {
+  local json="$1" key="$2" seen="" before after
+  JSON_KEY_BEFORE=""
+  JSON_KEY_AFTER=""
   after="$json"
   while :; do
     before="${after%%\""$key"\"*}"
     [ "$before" = "$after" ] && return 1
     after="${after#*\""$key"\"}"
-    case "$before" in
-      *\\) continue ;;
-    esac
-    printf '%s' "$after"
-    return 0
-  done
-}
-
-# Print everything that precedes the first unescaped `"<key>"`, or all of <json>
-# when the key does not occur.
-json_before_key() {
-  local json="$1" key="$2" seen="" before after
-  after="$json"
-  while :; do
-    before="${after%%\""$key"\"*}"
-    if [ "$before" = "$after" ]; then
-      printf '%s' "$json"
-      return 0
-    fi
-    after="${after#*\""$key"\"}"
+    # A backslash immediately before the opening quote means we matched text
+    # inside some other string value, not a key. Keep looking.
     case "$before" in
       *\\)
         seen="$seen$before\"$key\""
         continue
         ;;
     esac
-    printf '%s' "$seen$before"
+    JSON_KEY_BEFORE="$seen$before"
+    JSON_KEY_AFTER="$after"
     return 0
   done
+}
+
+# Print everything that follows the first unescaped `"<key>"`, or return 1 when
+# the key does not occur.
+json_after_key() {
+  json_find_key "$1" "$2" || return 1
+  printf '%s' "$JSON_KEY_AFTER"
+}
+
+# Print everything that precedes the first unescaped `"<key>"`, or all of <json>
+# when the key does not occur.
+json_before_key() {
+  if json_find_key "$1" "$2"; then
+    printf '%s' "$JSON_KEY_BEFORE"
+  else
+    printf '%s' "$1"
+  fi
 }
 
 # Read the string value of a key out of a JSON blob, ignoring occurrences that
@@ -138,19 +148,14 @@ json_before_key() {
 # Usage: json_string <json> <key>; prints the value, returns 1 if not found.
 json_string() {
   local json="$1" key="$2"
-  local before after raw seg trailing slashes
+  local after raw seg trailing slashes
 
   after="$json"
   while :; do
-    before="${after%%\""$key"\"*}"
-    # No (further) occurrence of the key.
-    [ "$before" = "$after" ] && return 1
-    after="${after#*\""$key"\"}"
-    # A backslash immediately before the opening quote means we matched text
-    # inside some other string value, not a key. Keep looking.
-    case "$before" in
-      *\\) continue ;;
-    esac
+    # A `continue` below resumes the search from just past this hit, so a key
+    # whose value is not a string does not end the search.
+    json_find_key "$after" "$key" || return 1
+    after="$JSON_KEY_AFTER"
 
     while :; do
       case "$after" in
@@ -276,17 +281,24 @@ resolve_path() {
 # Skip rules
 # ---------------------------------------------------------------------------
 
+# The pattern is empty rather than `.` so that it matches an empty line too. A
+# file of nothing but newlines is text, and `.` finds nothing to match in it —
+# which grep reports the same way it reports a binary file. What is left is
+# `-I`, which is the actual question being asked.
+#
 # Empty files count as text; `grep -I` reports "no match" for them either way.
 is_text_file() {
   [ -s "$1" ] || return 0
-  LC_ALL=C grep -Iq . -- "$1" 2>/dev/null
+  LC_ALL=C grep -Iq '' -- "$1" 2>/dev/null
 }
 
+# `check-ignore` answers this on its own: 0 is ignored, 1 is not, and 128 is
+# "not a repository" — which is also not ignored. Asking `rev-parse` first only
+# buys a second fork on a path that runs after every edit.
 is_git_ignored() {
   local file="$1" dir
   command -v git >/dev/null 2>&1 || return 1
   dir="$(dirname -- "$file")"
-  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
   git -C "$dir" check-ignore -q -- "$file" 2>/dev/null
 }
 
@@ -322,6 +334,17 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Quote a value so that it survives run_one's eval as a single word. The edited
+# file reaches the command as a positional parameter, but a pinned binary or a
+# discovered config is spliced into the template as text — and a project
+# directory with a space in it is ordinary.
+shell_quote() {
+  local s="$1"
+  local q="'"
+  local esc="'\''"
+  printf "'%s'" "${s//"$q"/$esc}"
+}
+
 # Lowercase without ${var,,}, which is Bash 4+.
 lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
@@ -341,6 +364,11 @@ extension_of() {
 # a stray ~/pyproject.toml should not change how a project is linted.
 ceiling_dir() {
   local dir="$1" top
+  # main resolves this once per run; every find_up after that is a free read.
+  if [ -n "$LINT_HOOK_CEILING" ]; then
+    printf '%s' "$LINT_HOOK_CEILING"
+    return 0
+  fi
   if have git; then
     top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
     if [ -n "$top" ]; then
@@ -357,14 +385,23 @@ find_up() {
   local dir="$1" ceiling name
   shift
   ceiling="$(ceiling_dir "$dir")"
+  # A ceiling of "/" would make the containment pattern below "//*"; dropping
+  # the slash leaves "/*", which still matches everything beneath the root.
+  [ "$ceiling" = "/" ] && ceiling=""
   while :; do
+    # Containment, not equality. The walk starts outside the ceiling whenever
+    # the edited file lives outside the project, and an equality test never
+    # fires there — the walk climbs to /, reading whatever $HOME contains.
+    case "$dir" in
+      "$ceiling" | "$ceiling"/*) ;;
+      *) break ;;
+    esac
     for name in "$@"; do
       if [ -e "$dir/$name" ]; then
         printf '%s' "$dir/$name"
         return 0
       fi
     done
-    [ "$dir" = "$ceiling" ] && break
     [ "$dir" = "/" ] && break
     dir="$(dirname -- "$dir")"
   done
@@ -389,32 +426,69 @@ node_bin() {
 # Syntax-only checkers for data formats. Exit 127 is the agreed signal for "no
 # usable backend", which the runner treats as tooling absence rather than a
 # lint failure.
+#
+# Three things each of these has to get right. The module probe happens inside
+# the interpreter that does the parsing, because a separate `python3 -c "import
+# yaml"` doubles the interpreter startups on a path that runs after every edit.
+# The file is opened in binary, so that a UTF-8 file does not fail to parse
+# under an ASCII locale. And a failure prints the message alone: a traceback is
+# noise in the context of the agent that has to read it.
 lh_check_json() {
   if have jq; then
     jq empty -- "$1"
     return $?
   fi
-  if have python3; then
-    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1"
-    return $?
-  fi
-  return 127
+  have python3 || return 127
+  python3 - "$1" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], "rb") as f:
+        json.load(f)
+except (OSError, ValueError) as e:
+    sys.stderr.write("%s\n" % e)
+    sys.exit(1)
+PY
 }
 
+# safe_load_all, not safe_load: a file holding several `---`-separated documents
+# is valid YAML, and safe_load rejects it outright as a syntax error.
 lh_check_yaml() {
-  if have python3 && python3 -c 'import yaml' 2>/dev/null; then
-    python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$1"
-    return $?
-  fi
-  return 127
+  have python3 || return 127
+  python3 - "$1" <<'PY'
+import sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(127)
+
+try:
+    with open(sys.argv[1], "rb") as f:
+        list(yaml.safe_load_all(f))
+except (OSError, yaml.YAMLError) as e:
+    sys.stderr.write("%s\n" % e)
+    sys.exit(1)
+PY
 }
 
 lh_check_toml() {
-  if have python3 && python3 -c 'import tomllib' 2>/dev/null; then
-    python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],"rb"))' "$1"
-    return $?
-  fi
-  return 127
+  have python3 || return 127
+  python3 - "$1" <<'PY'
+import sys
+
+try:
+    import tomllib
+except ImportError:
+    sys.exit(127)
+
+try:
+    with open(sys.argv[1], "rb") as f:
+        tomllib.load(f)
+except (OSError, tomllib.TOMLDecodeError) as e:
+    sys.stderr.write("%s\n" % e)
+    sys.exit(1)
+PY
 }
 
 # The table. Prints the linters to run for <file>, one per line, as:
@@ -440,9 +514,17 @@ linters_for() {
       ;;
     js | jsx | mjs | cjs | ts | tsx | mts | cts)
       if find_up "$dir" biome.json biome.jsonc >/dev/null && bin="$(node_bin biome "$dir")"; then
-        printf 'biome\tstatus\t%s lint --reporter=summary {file}\n' "$bin"
-      elif bin="$(node_bin eslint "$dir")"; then
-        printf 'eslint\tstatus\t%s --no-color --format=unix {file}\n' "$bin"
+        printf 'biome\tstatus\t%s lint --reporter=summary {file}\n' "$(shell_quote "$bin")"
+      # Gated on a config for the same reason biome is: eslint with nothing to
+      # configure it exits non-zero saying so, which would reach the agent as a
+      # lint failure it cannot fix by editing its file. An `eslintConfig` block
+      # in package.json is not honoured — eslint 9 dropped it.
+      elif find_up "$dir" eslint.config.js eslint.config.mjs eslint.config.cjs \
+        eslint.config.ts eslint.config.mts eslint.config.cts \
+        .eslintrc.js .eslintrc.cjs .eslintrc.yaml .eslintrc.yml \
+        .eslintrc.json .eslintrc >/dev/null &&
+        bin="$(node_bin eslint "$dir")"; then
+        printf 'eslint\tstatus\t%s --no-color --format=unix {file}\n' "$(shell_quote "$bin")"
       fi
       ;;
     sh | bash)
@@ -467,17 +549,25 @@ linters_for() {
       ;;
     java)
       if have checkstyle && cfg="$(find_up "$dir" checkstyle.xml config/checkstyle/checkstyle.xml)"; then
-        printf 'checkstyle\tstatus\tcheckstyle -c %s {file}\n' "$cfg"
+        printf 'checkstyle\tstatus\tcheckstyle -c %s {file}\n' "$(shell_quote "$cfg")"
       fi
       ;;
     json)
-      printf 'json-syntax\tstatus\tlh_check_json {file}\n'
+      # Gated like every other branch. Learning that the backend is missing by
+      # forking an interpreter is a cost paid on every single edit.
+      if have jq || have python3; then
+        printf 'json-syntax\tstatus\tlh_check_json {file}\n'
+      fi
       ;;
     yaml | yml)
-      printf 'yaml-syntax\tstatus\tlh_check_yaml {file}\n'
+      if have python3; then
+        printf 'yaml-syntax\tstatus\tlh_check_yaml {file}\n'
+      fi
       ;;
     toml)
-      printf 'toml-syntax\tstatus\tlh_check_toml {file}\n'
+      if have python3; then
+        printf 'toml-syntax\tstatus\tlh_check_toml {file}\n'
+      fi
       ;;
     md | markdown)
       # Opinionated, so off until lint-hook.toml can switch it on in Phase 3.
@@ -494,32 +584,45 @@ linters_for() {
 #
 # The edited path is handed to the command as a positional parameter rather than
 # spliced into the string, so a path with spaces, quotes, or shell metacharacters
-# needs no escaping and cannot alter the command.
+# needs no escaping and cannot alter the command. Whatever the table splices in
+# itself goes through shell_quote, for the same reason.
 #
 # Linters run from the project root, with a root-relative path where possible.
 # Most of them resolve their own config relative to the working directory, so
 # this is what makes a project's settings apply — and it keeps absolute paths
-# out of the diagnostics the agent has to read.
+# out of the diagnostics the agent has to read. That path is both the argument
+# handed to the linter and the name reported back, so it is one parameter.
 run_one() {
-  local name="$1" mode="$2" template="$3" target="$4" label="$5"
+  local name="$1" mode="$2" template="$3" file="$4"
   # The literal text "$1" is the substitution, expanded later by eval against
   # the positional parameter set below — not by this assignment.
   # shellcheck disable=SC2016
   local placeholder='"$1"'
   local cmd out status
 
+  # Without a usable root the linter would run against whatever directory the
+  # caller happened to be sitting in and report on the wrong tree. `cd ""`
+  # succeeds in Bash, so an unset root has to be caught by hand.
+  if [ -z "$LINT_HOOK_ROOT" ] || [ ! -d "$LINT_HOOK_ROOT" ]; then
+    debug "$name: project root unusable (${LINT_HOOK_ROOT:-unset}), skipping"
+    return 0
+  fi
+
   cmd="${template//"{file}"/$placeholder}"
   debug "$name: $cmd"
 
   out="$(
-    cd "$LINT_HOOK_ROOT" 2>/dev/null || exit 127
-    set -- "$target"
+    cd -- "$LINT_HOOK_ROOT" 2>/dev/null || exit 126
+    set -- "$file"
     eval "$cmd" 2>&1
   )"
   status=$?
 
-  if [ "$status" -eq 127 ]; then
-    debug "$name: not installed, skipping"
+  # 127 is "not found" and 126 is "found but not executable" — a linter left
+  # non-executable by a partial install, or a root that went away underneath
+  # us. Both are tooling absence, which must never block the agent.
+  if [ "$status" -eq 127 ] || [ "$status" -eq 126 ]; then
+    debug "$name: not runnable (exit $status), skipping"
     return 0
   fi
 
@@ -528,7 +631,7 @@ run_one() {
     *) [ "$status" -eq 0 ] && return 0 ;;
   esac
 
-  printf '%s: %s\n' "$name" "$label" >&2
+  notice "$name: $file"
   [ -n "$out" ] && printf '%s\n' "$out" >&2
   return 1
 }
@@ -536,12 +639,14 @@ run_one() {
 # Run every linter the table produced for the file. Returns 0 when all are
 # clean, 1 when any reported problems.
 run_linters() {
-  local target="$1" label="$2" plan="$3"
+  local file="$1" plan="$2"
   local name mode template failed=0
 
   while IFS="$LINT_HOOK_TAB" read -r name mode template; do
     [ -n "$name" ] || continue
-    run_one "$name" "$mode" "$template" "$target" "$label" || failed=1
+    # </dev/null: this loop's stdin is the plan, and a linter that reads stdin
+    # would swallow the rows that have not been dispatched yet.
+    run_one "$name" "$mode" "$template" "$file" </dev/null || failed=1
   done <<EOF
 $plan
 EOF
@@ -596,7 +701,8 @@ main() {
   should_skip "$resolved" && return "$EXIT_OK"
 
   LINT_HOOK_ROOT="$root"
-  debug "lintable: $resolved (root: $root)"
+  LINT_HOOK_CEILING="$(ceiling_dir "$(dirname -- "$resolved")")"
+  debug "lintable: $resolved (root: $root, ceiling: $LINT_HOOK_CEILING)"
 
   ext="$(extension_of "$resolved")"
   if [ -z "$ext" ]; then
@@ -613,8 +719,13 @@ main() {
   # Refer to the file the way the agent does. A file outside the project root
   # keeps its absolute path, since a relative one would not resolve there.
   label="${resolved#"$root"/}"
+  # A leading dash reads as a bundle of short options to every linter we
+  # dispatch to. "./" makes it a path again and leaves every other name alone.
+  case "$label" in
+    -*) label="./$label" ;;
+  esac
 
-  if run_linters "$label" "$label" "$plan"; then
+  if run_linters "$label" "$plan"; then
     return "$EXIT_OK"
   fi
   return "$EXIT_BLOCK"
