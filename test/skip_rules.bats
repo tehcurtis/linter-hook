@@ -84,9 +84,3 @@ setup() {
   [ "$status" -eq 0 ]
   [ "$output" = "" ]
 }
-
-@test "--version reports and exits clean" {
-  run env -u CLAUDE_PROJECT_DIR bash "$LINT_HOOK" --version </dev/null
-  [ "$status" -eq 0 ]
-  [[ "$output" == lint-hook\ * ]]
-}

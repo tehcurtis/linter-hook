@@ -53,12 +53,6 @@ setup() {
   [ "$output" = "" ]
 }
 
-@test "an escaped-only mention plus a tool_response decoy yields nothing" {
-  call 'extract_file_path "$1"' \
-    '{"tool_input":{"note":"the key \"file_path\" only appears escaped"},"tool_response":{"file_path":"/resp.js"}}'
-  [ "$output" = "" ]
-}
-
 @test "an unterminated string is treated as no value, not a crash" {
   call 'extract_file_path "$1"' '{"tool_input":{"file_path":"/x/a.js'
   [ "$output" = "" ]

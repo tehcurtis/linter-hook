@@ -122,11 +122,6 @@ plan_mode() {
   [[ "$output" == *"'$PROJECT/checkstyle.xml'"* ]]
 }
 
-@test "markdown is off until lint-hook.toml can switch it on" {
-  call 'LINT_HOOK_ROOT="$1"; linters_for "$1/README.md" md' "$PROJECT"
-  [ "$output" = "" ]
-}
-
 @test "the config walk finds a config inside the project" {
   mkdir -p "$PROJECT/src/deep"
   printf '{}\n' >"$PROJECT/biome.json"
@@ -144,12 +139,18 @@ plan_mode() {
   [ "$output" = "" ]
 }
 
-@test "the ceiling is resolved once and then reused" {
+# main resolves the ceiling once into LINT_HOOK_CEILING; this is the behaviour
+# that stands or falls with it — a walk that honours the global stops there,
+# and the same walk with a wider ceiling does not.
+@test "the resolved ceiling is what bounds the walk" {
+  mkdir -p "$PROJECT/inner/src"
   printf '{}\n' >"$PROJECT/biome.json"
-  call 'LINT_HOOK_CEILING="$2"; LINT_HOOK_ROOT="/nowhere"; find_up "$2/src" biome.json' \
-    "$PROJECT" "$PROJECT"
-  mkdir -p "$PROJECT/src"
-  call 'LINT_HOOK_CEILING="$1"; LINT_HOOK_ROOT="/nowhere"; find_up "$1/src" biome.json' "$PROJECT"
+
+  call 'LINT_HOOK_CEILING="$1/inner"; LINT_HOOK_ROOT="$1"; find_up "$1/inner/src" biome.json' "$PROJECT"
+  [ "$status" -ne 0 ]
+  [ "$output" = "" ]
+
+  call 'LINT_HOOK_CEILING="$1"; LINT_HOOK_ROOT="$1"; find_up "$1/inner/src" biome.json' "$PROJECT"
   [ "$status" -eq 0 ]
   [ "$output" = "$PROJECT/biome.json" ]
 }

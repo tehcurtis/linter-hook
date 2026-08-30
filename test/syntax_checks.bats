@@ -105,11 +105,18 @@ needs_module() {
   [ "$status" -eq 127 ]
 }
 
+# A throwaway venv rather than "skip when PyYAML happens to be absent": CI
+# installs PyYAML, so the skip version of this test never ran where it counts.
+# --without-pip keeps it to well under a second.
 @test "a missing python module is tooling absence" {
   needs_python3
   printf 'a: 1\n' >"$PROJECT/x.yaml"
-  python3 -c 'import yaml' 2>/dev/null && skip "PyYAML is installed, so the probe cannot fail"
-  use_path_without_jq python3
+  python3 -m venv --without-pip "$BATS_TEST_TMPDIR/bare" 2>/dev/null ||
+    skip "python3 cannot create a venv"
+  PATH="$STUB_BIN:$BATS_TEST_TMPDIR/bare/bin:/usr/bin:/bin"
+  export PATH
+  python3 -c 'import yaml' 2>/dev/null && skip "the bare venv can still see PyYAML"
+
   call -127 'lh_check_yaml "$1"' "$PROJECT/x.yaml"
   [ "$status" -eq 127 ]
 }
