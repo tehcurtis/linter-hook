@@ -17,12 +17,18 @@ set -uo pipefail
 
 LINT_HOOK_VERSION="0.1.0-dev"
 
-# Exit codes, named so the contract is legible at the call sites. EXIT_BLOCK
-# arrives with the first thing that can actually fail, in Phase 2.
+# Exit codes, named so the contract is legible at the call sites.
 EXIT_OK=0
+EXIT_BLOCK=2
 
 # Characters JSON allows between tokens.
 LINT_HOOK_WS=$' \t\n\r'
+
+# Field separator for the linter table.
+LINT_HOOK_TAB=$'\t'
+
+# Ceiling for config-file lookups; set from the resolved project root.
+LINT_HOOK_ROOT=""
 
 # ---------------------------------------------------------------------------
 # Diagnostics
@@ -226,22 +232,27 @@ EOF
 # Path resolution
 # ---------------------------------------------------------------------------
 
-# The directory the hook should treat as the project root.
+# The directory the hook should treat as the project root, as a physical path.
+#
+# Canonicalising matters: the edited file is resolved physically, so a root that
+# still contains a symlink would share no prefix with it and every diagnostic
+# would come out with an absolute path. On macOS that is the common case, not
+# the exotic one — /tmp is a symlink to /private/tmp.
 project_dir() {
   local payload="$1" cwd
 
   if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_PROJECT_DIR" ]; then
-    printf '%s' "$CLAUDE_PROJECT_DIR"
+    (cd -- "$CLAUDE_PROJECT_DIR" && pwd -P)
     return 0
   fi
 
   cwd="$(json_string "$payload" "cwd")"
   if [ -n "$cwd" ] && [ -d "$cwd" ]; then
-    printf '%s' "$cwd"
+    (cd -- "$cwd" && pwd -P)
     return 0
   fi
 
-  printf '%s' "$PWD"
+  pwd -P
 }
 
 # Make a possibly-relative path absolute against the project root and collapse
@@ -304,11 +315,246 @@ should_skip() {
 }
 
 # ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# Lowercase without ${var,,}, which is Bash 4+.
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Extension of a path, lowercased and without the dot; empty when there is none.
+extension_of() {
+  local base="${1##*/}"
+  case "$base" in
+    ?*.*) lower "${base##*.}" ;;
+    *) printf '' ;;
+  esac
+}
+
+# Where to stop when walking up looking for config files: the enclosing git
+# repo if there is one, otherwise the project root. Never the filesystem root —
+# a stray ~/pyproject.toml should not change how a project is linted.
+ceiling_dir() {
+  local dir="$1" top
+  if have git; then
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
+    if [ -n "$top" ]; then
+      printf '%s' "$top"
+      return 0
+    fi
+  fi
+  printf '%s' "${LINT_HOOK_ROOT:-/}"
+}
+
+# Walk up from <dir> to the ceiling looking for any of the named entries, and
+# print the first hit.
+find_up() {
+  local dir="$1" ceiling name
+  shift
+  ceiling="$(ceiling_dir "$dir")"
+  while :; do
+    for name in "$@"; do
+      if [ -e "$dir/$name" ]; then
+        printf '%s' "$dir/$name"
+        return 0
+      fi
+    done
+    [ "$dir" = "$ceiling" ] && break
+    [ "$dir" = "/" ] && break
+    dir="$(dirname -- "$dir")"
+  done
+  return 1
+}
+
+# A project-local node_modules/.bin entry beats a global install, so that a repo
+# is linted with the version it pins.
+node_bin() {
+  local name="$1" dir="$2" hit
+  if hit="$(find_up "$dir" "node_modules/.bin/$name")"; then
+    printf '%s' "$hit"
+    return 0
+  fi
+  if have "$name"; then
+    command -v "$name"
+    return 0
+  fi
+  return 1
+}
+
+# Syntax-only checkers for data formats. Exit 127 is the agreed signal for "no
+# usable backend", which the runner treats as tooling absence rather than a
+# lint failure.
+lh_check_json() {
+  if have jq; then
+    jq empty -- "$1"
+    return $?
+  fi
+  if have python3; then
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1"
+    return $?
+  fi
+  return 127
+}
+
+lh_check_yaml() {
+  if have python3 && python3 -c 'import yaml' 2>/dev/null; then
+    python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$1"
+    return $?
+  fi
+  return 127
+}
+
+lh_check_toml() {
+  if have python3 && python3 -c 'import tomllib' 2>/dev/null; then
+    python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],"rb"))' "$1"
+    return $?
+  fi
+  return 127
+}
+
+# The table. Prints the linters to run for <file>, one per line, as:
+#
+#   <name><TAB><failure-mode><TAB><command template>
+#
+# Failure mode is `status` (a non-zero exit means problems) or `output` (any
+# output at all means problems, which is how `gofmt -l` reports). `{file}` in
+# the template is replaced with the edited file.
+#
+# Adding a linter should be a few lines here and nothing else.
+linters_for() {
+  local file="$1" ext="$2" dir bin cfg
+  dir="$(dirname -- "$file")"
+
+  case "$ext" in
+    py)
+      if have ruff; then
+        printf 'ruff\tstatus\truff check --no-cache --quiet --output-format=concise {file}\n'
+      elif have flake8; then
+        printf 'flake8\tstatus\tflake8 {file}\n'
+      fi
+      ;;
+    js | jsx | mjs | cjs | ts | tsx | mts | cts)
+      if find_up "$dir" biome.json biome.jsonc >/dev/null && bin="$(node_bin biome "$dir")"; then
+        printf 'biome\tstatus\t%s lint --reporter=summary {file}\n' "$bin"
+      elif bin="$(node_bin eslint "$dir")"; then
+        printf 'eslint\tstatus\t%s --no-color --format=unix {file}\n' "$bin"
+      fi
+      ;;
+    sh | bash)
+      if have shellcheck; then
+        printf 'shellcheck\tstatus\tshellcheck --format=gcc {file}\n'
+      fi
+      ;;
+    go)
+      # `gofmt -l` names files that need formatting and still exits 0, hence the
+      # output failure mode. `go vet` is deliberately absent: it works on whole
+      # packages, which would break the promise to report only the edited file.
+      if have gofmt; then
+        printf 'gofmt\toutput\tgofmt -l {file}\n'
+      fi
+      ;;
+    rs)
+      # rustfmt is file-scoped; clippy is crate-scoped, so it is left out for
+      # the same reason as go vet.
+      if have rustfmt; then
+        printf 'rustfmt\tstatus\trustfmt --check --edition 2021 {file}\n'
+      fi
+      ;;
+    java)
+      if have checkstyle && cfg="$(find_up "$dir" checkstyle.xml config/checkstyle/checkstyle.xml)"; then
+        printf 'checkstyle\tstatus\tcheckstyle -c %s {file}\n' "$cfg"
+      fi
+      ;;
+    json)
+      printf 'json-syntax\tstatus\tlh_check_json {file}\n'
+      ;;
+    yaml | yml)
+      printf 'yaml-syntax\tstatus\tlh_check_yaml {file}\n'
+      ;;
+    toml)
+      printf 'toml-syntax\tstatus\tlh_check_toml {file}\n'
+      ;;
+    md | markdown)
+      # Opinionated, so off until lint-hook.toml can switch it on in Phase 3.
+      :
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+# Run one linter. Returns 0 when the file is clean, 1 when it is not.
+#
+# The edited path is handed to the command as a positional parameter rather than
+# spliced into the string, so a path with spaces, quotes, or shell metacharacters
+# needs no escaping and cannot alter the command.
+#
+# Linters run from the project root, with a root-relative path where possible.
+# Most of them resolve their own config relative to the working directory, so
+# this is what makes a project's settings apply — and it keeps absolute paths
+# out of the diagnostics the agent has to read.
+run_one() {
+  local name="$1" mode="$2" template="$3" target="$4" label="$5"
+  # The literal text "$1" is the substitution, expanded later by eval against
+  # the positional parameter set below — not by this assignment.
+  # shellcheck disable=SC2016
+  local placeholder='"$1"'
+  local cmd out status
+
+  cmd="${template//"{file}"/$placeholder}"
+  debug "$name: $cmd"
+
+  out="$(
+    cd "$LINT_HOOK_ROOT" 2>/dev/null || exit 127
+    set -- "$target"
+    eval "$cmd" 2>&1
+  )"
+  status=$?
+
+  if [ "$status" -eq 127 ]; then
+    debug "$name: not installed, skipping"
+    return 0
+  fi
+
+  case "$mode" in
+    output) [ -n "$out" ] || return 0 ;;
+    *) [ "$status" -eq 0 ] && return 0 ;;
+  esac
+
+  printf '%s: %s\n' "$name" "$label" >&2
+  [ -n "$out" ] && printf '%s\n' "$out" >&2
+  return 1
+}
+
+# Run every linter the table produced for the file. Returns 0 when all are
+# clean, 1 when any reported problems.
+run_linters() {
+  local target="$1" label="$2" plan="$3"
+  local name mode template failed=0
+
+  while IFS="$LINT_HOOK_TAB" read -r name mode template; do
+    [ -n "$name" ] || continue
+    run_one "$name" "$mode" "$template" "$target" "$label" || failed=1
+  done <<EOF
+$plan
+EOF
+
+  return "$failed"
+}
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 main() {
-  local payload file root resolved
+  local payload file root resolved ext plan label
 
   case "${1-}" in
     --version)
@@ -316,6 +562,10 @@ main() {
       return "$EXIT_OK"
       ;;
   esac
+
+  # Linter output goes to an agent, not a terminal. Phase 4 strips whatever
+  # colour leaks through anyway.
+  export NO_COLOR=1
 
   # Invoked by hand with no piped payload: there is nothing to do, and blocking
   # on a terminal read would hang the caller.
@@ -345,11 +595,29 @@ main() {
 
   should_skip "$resolved" && return "$EXIT_OK"
 
+  LINT_HOOK_ROOT="$root"
   debug "lintable: $resolved (root: $root)"
 
-  # Phase 2 hangs linter detection off this point. Until then a lintable file is
-  # simply reported clean.
-  return "$EXIT_OK"
+  ext="$(extension_of "$resolved")"
+  if [ -z "$ext" ]; then
+    debug "no extension, nothing to detect"
+    return "$EXIT_OK"
+  fi
+
+  plan="$(linters_for "$resolved" "$ext")"
+  if [ -z "$plan" ]; then
+    debug "no linter available for .$ext"
+    return "$EXIT_OK"
+  fi
+
+  # Refer to the file the way the agent does. A file outside the project root
+  # keeps its absolute path, since a relative one would not resolve there.
+  label="${resolved#"$root"/}"
+
+  if run_linters "$label" "$label" "$plan"; then
+    return "$EXIT_OK"
+  fi
+  return "$EXIT_BLOCK"
 }
 
 # Only run when executed, not when sourced by the test suite.
